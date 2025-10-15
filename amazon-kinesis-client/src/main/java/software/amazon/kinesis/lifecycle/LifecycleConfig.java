@@ -62,4 +62,13 @@ public class LifecycleConfig {
      * <p>Default value: 0</p>
      */
     private int readTimeoutsToIgnoreBeforeWarning = DEFAULT_READ_TIMEOUTS_TO_IGNORE;
+
+    /**
+     * Enables shard coalescing feature. When true, the Scheduler may create multi-shard consumers that
+     * coalesce records from multiple shards into a single emission. The feature is hidden behind this flag
+     * and is disabled by default to preserve existing behavior.
+     *
+     * <p>Default value: false</p>
+     */
+    private boolean shardCoalescingEnabled = true;
 }

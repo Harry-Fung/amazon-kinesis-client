@@ -78,6 +78,7 @@ import software.amazon.kinesis.leases.LeaseRefresher;
 import software.amazon.kinesis.leases.LeaseSerializer;
 import software.amazon.kinesis.leases.MultiStreamLease;
 import software.amazon.kinesis.leases.ShardDetector;
+import software.amazon.kinesis.leases.ShardGroupInfo;
 import software.amazon.kinesis.leases.ShardInfo;
 import software.amazon.kinesis.leases.ShardPrioritization;
 import software.amazon.kinesis.leases.ShardSyncTaskManager;
@@ -88,6 +89,7 @@ import software.amazon.kinesis.leases.exceptions.DependencyException;
 import software.amazon.kinesis.leases.exceptions.InvalidStateException;
 import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
 import software.amazon.kinesis.lifecycle.ConsumerTaskFactory;
+import software.amazon.kinesis.lifecycle.GroupedShardConsumers;
 import software.amazon.kinesis.lifecycle.LifecycleConfig;
 import software.amazon.kinesis.lifecycle.ShardConsumer;
 import software.amazon.kinesis.lifecycle.ShardConsumerArgument;
@@ -102,6 +104,7 @@ import software.amazon.kinesis.metrics.MetricsScope;
 import software.amazon.kinesis.metrics.MetricsUtil;
 import software.amazon.kinesis.processor.Checkpointer;
 import software.amazon.kinesis.processor.FormerStreamsLeasesDeletionStrategy;
+import software.amazon.kinesis.processor.FormerStreamsLeasesDeletionStrategy.StreamsLeasesDeletionType;
 import software.amazon.kinesis.processor.ProcessorConfig;
 import software.amazon.kinesis.processor.ShardRecordProcessorFactory;
 import software.amazon.kinesis.processor.StreamTracker;
@@ -205,6 +208,10 @@ public class Scheduler implements Runnable {
     // Holds consumers for shards the worker is currently tracking. Key is shard
     // info, value is ShardConsumer.
     private final ConcurrentMap<ShardInfo, ShardConsumer> shardInfoShardConsumerMap = new ConcurrentHashMap<>();
+
+    // Map from Group meta data (e.g., stream identifier or other grouping key) to a grouped shard consumer container.
+    private final ConcurrentMap<ShardGroupInfo, GroupedShardConsumers> groupedShardInfoShardConsumersMap =
+            new ConcurrentHashMap<>();
 
     private volatile boolean shutdown;
     private volatile long shutdownStartTimeMillis;
@@ -376,6 +383,7 @@ public class Scheduler implements Runnable {
                 ? null
                 : new SchemaRegistryDecoder(this.retrievalConfig.glueSchemaRegistryDeserializer());
         this.taskFactory = leaseManagementConfig().consumerTaskFactory();
+        log.info("Shard coalescing enabled: {}", lifecycleConfig.shardCoalescingEnabled());
     }
 
     /**
@@ -557,12 +565,34 @@ public class Scheduler implements Runnable {
     void runProcessLoop() {
         try {
             Set<ShardInfo> assignedShards = new HashSet<>();
-            for (ShardInfo shardInfo : getShardInfoForAssignments()) {
-                ShardConsumer shardConsumer = createOrGetShardConsumer(
-                        shardInfo, processorConfig.shardRecordProcessorFactory(), leaseCleanupManager);
 
-                shardConsumer.executeLifecycle();
-                assignedShards.add(shardInfo);
+            List<ShardInfo> shardInfoList = getShardInfoForAssignments();
+
+            if (!lifecycleConfig.shardCoalescingEnabled()) {
+                for (ShardInfo shardInfo : shardInfoList) {
+                    ShardConsumer shardConsumer = createOrGetShardConsumer(
+                            shardInfo, processorConfig.shardRecordProcessorFactory(), leaseCleanupManager);
+
+                    shardConsumer.executeLifecycle();
+                    assignedShards.add(shardInfo);
+                }
+            } else {
+                // NOTE:
+                // Currently don't support multi-stream mode for shard coalescing
+                // In initial grouping phase we DO NOT create a special multi-shard consumer instance.
+                // GroupedShardConsumer is metadata only; each shard retains its own ShardConsumer.
+                String groupId = getStreamIdentifier(Optional.empty()).serialize();
+                ShardGroupInfo groupInfo = new ShardGroupInfo(groupId);
+                GroupedShardConsumers groupedShardConsumers = groupedShardInfoShardConsumersMap.computeIfAbsent(
+                        groupInfo, k -> new GroupedShardConsumers(groupId));
+
+                for (ShardInfo shardInfo : shardInfoList) {
+                    ShardConsumer shardConsumer = createOrGetShardConsumer(
+                            shardInfo, processorConfig.shardRecordProcessorFactory(), leaseCleanupManager);
+                    groupedShardConsumers.addShard(shardInfo, shardConsumer);
+                    assignedShards.add(shardInfo);
+                }
+                groupedShardConsumers.executeGroupedConsumerLifecycle();
             }
 
             // clean up shard consumers for unassigned shards
