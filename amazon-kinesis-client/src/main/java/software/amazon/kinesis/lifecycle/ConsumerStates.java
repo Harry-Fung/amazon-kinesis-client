@@ -16,13 +16,14 @@ package software.amazon.kinesis.lifecycle;
 
 import lombok.Getter;
 import lombok.experimental.Accessors;
+import software.amazon.kinesis.lifecycle.ConsumerStates.ShardConsumerState;
 import software.amazon.kinesis.lifecycle.events.ProcessRecordsInput;
 
 /**
  * Top level container for all the possible states a {@link ShardConsumer} can be in. The logic for creation of tasks,
  * and state transitions is contained within the {@link ConsumerState} objects.
  *
- * <h2>State Diagram</h2>
+* <h2>State Diagram</h2>
  *
  * <pre>
  *       +-------------------+
@@ -42,12 +43,12 @@ import software.amazon.kinesis.lifecycle.events.ProcessRecordsInput;
  *  |           +------+-------------+  |       |              | |     Complete      |             |
  *  |           |     Processing     +--+       |              | ++-----------+------+             |
  *  |       +---+                    |          |              |  |           |                    |
- *  |       |   |                    +----------+              |  |           | Shutdown:          |
- *  |       |   +------+-------------+          |              \  /           |  Requested         |
- *  |       |          |                        |               \/            +--------------------+
- *  |       |          |                        |               ||
- *  |       | Success  |                        |               || Shutdown:
- *  |       +----------+                        |               ||  Terminated
+ *  |       |   |  +------------+    |          |              |  |           | Shutdown:          |
+ *  |       |   +->|  Updating  +----+          |              \  /           |  Requested         |
+ *  |       |      |            |               |               \/            +--------------------+
+ *  |       |      +-----+------+               |               ||
+ *  |       | Success    | Success              |               || Shutdown:
+ *  |       +------------+                      |               ||  Terminated
  *  |                                           |               ||  Zombie
  *  |                                           |               ||
  *  |                                           |               ||
@@ -78,6 +79,7 @@ class ConsumerStates {
         WAITING_ON_PARENT_SHARDS(new BlockedOnParentState()),
         INITIALIZING(new InitializingState()),
         PROCESSING(new ProcessingState()),
+        UPDATING(new UpdatingState()),
         SHUTDOWN_REQUESTED(new ShutdownNotificationState()),
         SHUTTING_DOWN(new ShuttingDownState()),
         SHUTDOWN_COMPLETE(new ShutdownCompleteState());
@@ -281,6 +283,43 @@ class ConsumerStates {
             return true;
         }
     }
+
+    static class UpdatingState implements ConsumerState {
+        @Override
+        public ConsumerTask createTask(
+                ShardConsumerArgument argument,
+                ShardConsumer consumer,
+                ProcessRecordsInput input,
+                ConsumerTaskFactory taskFactory) {
+            return null; // No task execution during update
+        }
+
+        @Override
+        public ConsumerState successTransition() {
+            return ShardConsumerState.PROCESSING.consumerState();
+        }
+
+        @Override
+        public ConsumerState shutdownTransition(ShutdownReason shutdownReason) {
+            return shutdownReason.shutdownState();
+        }
+
+        @Override
+        public TaskType taskType() {
+            return TaskType.UPDATE;
+        }
+
+        @Override
+        public ShardConsumerState state() {
+            return ShardConsumerState.UPDATING;
+        }
+
+        @Override
+        public boolean isTerminal() {
+            return false;
+        }
+    }
+
 
     static final ConsumerState SHUTDOWN_REQUEST_COMPLETION_STATE = new ShutdownNotificationCompletionState();
 

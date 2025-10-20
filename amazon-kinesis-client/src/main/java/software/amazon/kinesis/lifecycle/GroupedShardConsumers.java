@@ -1,12 +1,16 @@
 package software.amazon.kinesis.lifecycle;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import software.amazon.kinesis.leases.ShardInfo;
+import software.amazon.kinesis.lifecycle.events.ProcessRecordsInput;
 
 /**
  * Composition-based group of per-shard {@link ShardConsumer} instances.
@@ -15,13 +19,24 @@ import software.amazon.kinesis.leases.ShardInfo;
  * and processing semantics are unchanged. Future phases will add buffering and coalesced emission
  * within this aggregation boundary.
  */
+@Slf4j
 public class GroupedShardConsumers implements ShardGroup {
 
+    @Getter
     private final ConcurrentHashMap<ShardInfo, ShardConsumer> children = new ConcurrentHashMap<>();
+
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
+
+    private final AtomicBoolean updating = new AtomicBoolean(false);
+
+    private final ReentrantLock updateLock = new ReentrantLock();
 
     @Getter
     private final String groupId;
+
+    // private volatile int targetBatchSize = 100;
+    // private volatile long maxBufferTimeMs = 1000;
+    // private volatile long lastEmitTime = System.currentTimeMillis();
 
     public GroupedShardConsumers(String groupId) {
         this.groupId = groupId;
@@ -29,15 +44,38 @@ public class GroupedShardConsumers implements ShardGroup {
 
     @Override
     public void addShard(ShardInfo shardInfo, ShardConsumer child) {
-        if (shutdown.get()) {
-            return; // ignore additions after shutdown
+        updateLock.lock();
+        try {
+            if (shutdown.get()) return; // ignore additions after shutdown
+
+            updating.set(true);
+            // Pause all existing consumers
+            children.values().forEach(this::transitionToUpdating);
+
+            children.putIfAbsent(shardInfo, child);
+
+            // Resume all consumers
+            children.values().forEach(this::transitionToProcessing);
+            updating.set(false);
+        } finally {
+            updateLock.unlock();
         }
-        children.putIfAbsent(shardInfo, child);
     }
 
     @Override
     public void removeShard(ShardInfo shardInfo) {
-        children.remove(shardInfo);
+        updateLock.lock();
+        try {
+            updating.set(true);
+            children.values().forEach(this::transitionToUpdating);
+
+            children.remove(shardInfo);
+
+            children.values().forEach(this::transitionToProcessing);
+            updating.set(false);
+        } finally {
+            updateLock.unlock();
+        }
     }
 
     @Override
@@ -62,57 +100,57 @@ public class GroupedShardConsumers implements ShardGroup {
         }
     }
 
-    // public void createOrGetGroupedShardConsumers() {
-    //     // Coalescing enabled: group shards by a stable group id (default: stream identifier)
-    //     final StreamIdentifier streamIdentifier = getStreamIdentifier(shardInfo.streamIdentifierSerOpt());
-    //     final ShardGroupInfo shardGroupInfo = ShardGroupInfo.from(shardInfo, streamIdentifier);
-    //     GroupedShardConsumers group = groupedShardInfoShardConsumersMap.get(shardGroupInfo);
-    //     if (group == null) {
-    //         final GroupedShardConsumers created = new GroupedShardConsumers(shardGroupInfo.getGroupId());
-    //         final GroupedShardConsumers existing =
-    //                 groupedShardInfoShardConsumersMap.putIfAbsent(shardGroupInfo, created);
-    //         group = existing == null ? created : existing;
-    //         if (existing == null) {
-    //             slog.infoForce("Created new GroupedShardConsumer metadata group: " + shardGroupInfo.getGroupId());
-    //         }
-    //     }
-
-    //     // Build a standard per-shard ShardConsumer (no semantic change) and register it in the group and per-shard
-    // map
-    //     if ((consumer == null)
-    //             || (consumer.isShutdown() && consumer.shutdownReason().equals(ShutdownReason.LEASE_LOST))) {
-    //         consumer = buildConsumer(shardInfo, shardRecordProcessorFactory, leaseCleanupManager);
-    //         shardInfoShardConsumerMap.put(shardInfo, consumer);
-    //         slog.infoForce("Created new shardConsumer for : " + shardInfo + " in group " +
-    // shardGroupInfo.getGroupId());
-    //     }
-    //     group.addShard(shardInfo, consumer);
-    // }
-
-    // public void cleanupGroupedShardConsumers() {
-    //     // Grouped mode: remove shard membership metadata, retain per-shard lifecycle semantics.
-    //     shardInfoShardConsumerMap.remove(shard);
-    //     final StreamIdentifier streamIdentifier = getStreamIdentifier(shard.streamIdentifierSerOpt());
-    //     final ShardGroupInfo shardGroupInfo = ShardGroupInfo.from(shard, streamIdentifier);
-    //     final GroupedShardConsumers group = groupedShardInfoShardConsumersMap.get(shardGroupInfo);
-    //     if (group != null) {
-    //         group.removeShard(shard);
-    //         log.info("Removed shard {} from group {}", ShardInfo.getLeaseKey(shard), group.getGroupId());
-    //         if (group.shardCount() == 0) {
-    //             group.shutdownIfEmpty();
-    //             groupedShardInfoShardConsumersMap.remove(shardGroupInfo, group);
-    //             log.info("Removed empty group {}", shardGroupInfo.getGroupId());
-    //         }
-    //     }
-    // }
-
     public void executeGroupedConsumerLifecycle() {
         // TODO: may need special handling here
         //  or modify the existing logic in the ShardConsumer class
         //
-//        System.out.println("HARRXF: " + this.groupId);
         for (ShardConsumer shardConsumer : children.values()) {
             shardConsumer.executeLifecycle();
         }
     }
+
+    private void transitionToUpdating(ShardConsumer consumer) {
+        // Inject UPDATING state transition
+        consumer.pauseForUpdate();
+    }
+
+    private void transitionToProcessing(ShardConsumer consumer) {
+        consumer.resumeFromUpdate();
+    }
+
+    // public void bufferRecords(ShardInfo shardInfo, ProcessRecordsInput input) {
+    //     if (updating.get()) {
+    //         // Queue during updates
+    //         buffer.offer(input);
+    //         return;
+    //     }
+
+    //     buffer.offer(input);
+
+    //     // Check if we should emit
+    //     if (shouldEmit()) {
+    //         emitCoalescedBatch();
+    //     }
+    // }
+
+    // private boolean shouldEmit() {
+    //     return buffer.size() >= targetBatchSize ||
+    //            (System.currentTimeMillis() - lastEmitTime) >= maxBufferTimeMs;
+    // }
+
+    // private void emitCoalescedBatch() {
+    //     List<ProcessRecordsInput> batch = new ArrayList<>();
+    //     ProcessRecordsInput input;
+    //     while ((input = buffer.poll()) != null && batch.size() < targetBatchSize) {
+    //         batch.add(input);
+    //     }
+
+    //     if (!batch.isEmpty()) {
+    //         ProcessRecordsInput coalesced = coalesceInputs(batch);
+    //         // Emit to single handler or distribute
+    //         lastEmitTime = System.currentTimeMillis();
+    //     }
+    // }
+
+
 }

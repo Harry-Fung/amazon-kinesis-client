@@ -27,6 +27,7 @@ public final class ShardGroupInfo {
      * All shards with the same groupId belong to the same group.
      */
     @NonNull
+    @Getter
     private final String groupId;
 
     public ShardGroupInfo(@NonNull String groupId) {

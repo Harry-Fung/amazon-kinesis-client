@@ -69,6 +69,8 @@ public class ShardConsumer {
     private volatile Instant taskDispatchedAt;
     private volatile boolean taskIsRunning = false;
 
+    private volatile boolean pausedForUpdate = false;
+
     /**
      * Tracks current state. It is only updated via the consumeStream/shutdown APIs. Therefore we don't do
      * much coordination/synchronization to handle concurrent reads/updates.
@@ -147,6 +149,12 @@ public class ShardConsumer {
             subscription.cancel();
             return;
         }
+        if (pausedForUpdate) {
+            // TODO: During updating state, we do not process any records.
+            //  Or buffer in GroupedShardConsumers instead?
+            return;
+        }
+
         processData(input);
         if (taskOutcome == TaskOutcome.END_OF_SHARD) {
             markForShutdown(ShutdownReason.SHARD_END);
@@ -472,6 +480,24 @@ public class ShardConsumer {
             //
             if (shutdownReason == null || shutdownReason.canTransitionTo(reason)) {
                 shutdownReason = reason;
+            }
+        }
+    }
+
+    public void pauseForUpdate() {
+        synchronized (this) {
+            if (currentState.state() == ConsumerStates.ShardConsumerState.PROCESSING) {
+                pausedForUpdate = true;
+                currentState = ConsumerStates.ShardConsumerState.UPDATING.consumerState();
+            }
+        }
+    }
+
+    public void resumeFromUpdate() {
+        synchronized (this) {
+            if (currentState.state() == ConsumerStates.ShardConsumerState.UPDATING) {
+                pausedForUpdate = false;
+                currentState = ConsumerStates.ShardConsumerState.PROCESSING.consumerState();
             }
         }
     }

@@ -70,5 +70,5 @@ public class LifecycleConfig {
      *
      * <p>Default value: false</p>
      */
-    private boolean shardCoalescingEnabled = true;
+    private boolean shardCoalescingEnabled = false;
 }

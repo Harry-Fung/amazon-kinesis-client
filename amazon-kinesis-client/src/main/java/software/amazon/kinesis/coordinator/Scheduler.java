@@ -572,15 +572,7 @@ public class Scheduler implements Runnable {
 
             List<ShardInfo> shardInfoList = getShardInfoForAssignments();
 
-            if (!lifecycleConfig.shardCoalescingEnabled()) {
-                for (ShardInfo shardInfo : shardInfoList) {
-                    ShardConsumer shardConsumer = createOrGetShardConsumer(
-                            shardInfo, processorConfig.shardRecordProcessorFactory(), leaseCleanupManager);
-
-                    shardConsumer.executeLifecycle();
-                    assignedShards.add(shardInfo);
-                }
-            } else {
+            if (lifecycleConfig.shardCoalescingEnabled() && !isMultiStreamMode) {
                 // NOTE:
                 // Currently don't support multi-stream mode for shard coalescing
                 // In initial grouping phase we DO NOT create a special multi-shard consumer instance.
@@ -597,10 +589,22 @@ public class Scheduler implements Runnable {
                     assignedShards.add(shardInfo);
                 }
                 groupedShardConsumers.executeGroupedConsumerLifecycle();
+            } else if (!lifecycleConfig.shardCoalescingEnabled()) {
+                for (ShardInfo shardInfo : shardInfoList) {
+                    ShardConsumer shardConsumer = createOrGetShardConsumer(
+                            shardInfo, processorConfig.shardRecordProcessorFactory(), leaseCleanupManager);
+
+                    shardConsumer.executeLifecycle();
+                    assignedShards.add(shardInfo);
+                }
             }
 
             // clean up shard consumers for unassigned shards
-            cleanupShardConsumers(assignedShards);
+            if (!lifecycleConfig.shardCoalescingEnabled()) {
+                cleanupShardConsumers(assignedShards);
+            } else {
+                cleanupGroupedShardConsumers(assignedShards);
+            }
 
             // check for new streams and sync with the scheduler state
             if (isLeader()) {
@@ -1232,6 +1236,37 @@ public class Scheduler implements Runnable {
                 } else {
                     consumer.executeLifecycle();
                 }
+            }
+        }
+    }
+
+    void cleanupGroupedShardConsumers(Set<ShardInfo> assignedShards) {
+        for (Map.Entry<ShardGroupInfo, GroupedShardConsumers> entry : groupedShardInfoShardConsumersMap.entrySet()) {
+            final ShardGroupInfo shardGroupInfo = entry.getKey();
+            final GroupedShardConsumers groupedShardConsumers = entry.getValue();
+
+            // Identify shards which no longer belong in this group
+            for (Map.Entry<ShardInfo, ShardConsumer> childEntry :
+                    groupedShardConsumers.shardsView().entrySet()) {
+                final ShardInfo shardInfo = childEntry.getKey();
+                // If the shard is not assigned, drop membership.
+                if (!assignedShards.contains(shardInfo)) {
+                    // Shutdown the consumer since we are no longer responsible for the shard.
+                    // Remove the shard from the group only when the lease is lost.
+                    if (childEntry.getValue().leaseLost()) {
+                        log.info("Removing shard {} from group {} as lease has been lost",
+                                ShardInfo.getLeaseKey(shardInfo), shardGroupInfo.getGroupId());
+                        groupedShardConsumers.removeShard(shardInfo);
+                    } else {
+                        childEntry.getValue().executeLifecycle();
+                    }
+                }
+            }
+
+            if (groupedShardConsumers.shardCount() == 0) {
+                groupedShardConsumers.shutdownIfEmpty();
+                groupedShardInfoShardConsumersMap.remove(shardGroupInfo, groupedShardConsumers);
+                log.info("Removed empty group {}", shardGroupInfo.getGroupId());
             }
         }
     }

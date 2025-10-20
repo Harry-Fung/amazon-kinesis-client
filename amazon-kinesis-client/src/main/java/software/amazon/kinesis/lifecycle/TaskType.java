@@ -31,6 +31,10 @@ public enum TaskType {
      */
     PROCESS,
     /**
+     * Coalescing multiple shards for processing records. 
+     */
+    UPDATE,
+    /**
      * Shutdown of ShardRecordProcessor.
      */
     SHUTDOWN,

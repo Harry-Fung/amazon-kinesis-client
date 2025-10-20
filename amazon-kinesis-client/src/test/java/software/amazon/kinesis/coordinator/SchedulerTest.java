@@ -76,12 +76,14 @@ import software.amazon.kinesis.leases.LeaseManagementFactory;
 import software.amazon.kinesis.leases.LeaseRefresher;
 import software.amazon.kinesis.leases.MultiStreamLease;
 import software.amazon.kinesis.leases.ShardDetector;
+import software.amazon.kinesis.leases.ShardGroupInfo;
 import software.amazon.kinesis.leases.ShardInfo;
 import software.amazon.kinesis.leases.ShardSyncTaskManager;
 import software.amazon.kinesis.leases.dynamodb.DynamoDBLeaseRefresher;
 import software.amazon.kinesis.leases.exceptions.DependencyException;
 import software.amazon.kinesis.leases.exceptions.InvalidStateException;
 import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
+import software.amazon.kinesis.lifecycle.GroupedShardConsumers;
 import software.amazon.kinesis.lifecycle.LifecycleConfig;
 import software.amazon.kinesis.lifecycle.ShardConsumer;
 import software.amazon.kinesis.lifecycle.events.InitializationInput;
@@ -352,6 +354,50 @@ public class SchedulerTest {
         // verify shard consumers present in assignedShards aren't shut down
         assertFalse(shardConsumer0.isShutdownRequested());
         assertFalse(shardConsumer1.isShutdownRequested());
+    }
+
+    @Test
+    public void testCleanupGroupedShardConsumers_removesUnassignedAndRemovesEmptyGroup() {
+        final String shard0 = "shardId-000000000000";
+        final String shard1 = "shardId-000000000001";
+        final String concurrencyToken0 = "concurrencyToken0";
+        final String concurrencyToken1 = "concurrencyToken1";
+
+        final ShardInfo shardInfo0 =
+                new ShardInfo(shard0, concurrencyToken0, null, ExtendedSequenceNumber.TRIM_HORIZON);
+        final ShardInfo shardInfo1 =
+                new ShardInfo(shard1, concurrencyToken1, null, ExtendedSequenceNumber.TRIM_HORIZON);
+
+        // create shard consumers (also populates primary map via createOrGetShardConsumer)
+        final ShardConsumer shardConsumer0 =
+                scheduler.createOrGetShardConsumer(shardInfo0, shardRecordProcessorFactory, leaseCleanupManager);
+        final ShardConsumer shardConsumer1 =
+                scheduler.createOrGetShardConsumer(shardInfo1, shardRecordProcessorFactory, leaseCleanupManager);
+
+        // create a group and insert both shards
+        final String groupId = "test-group-1";
+        final ShardGroupInfo shardGroupInfo = ShardGroupInfo.of(groupId);
+        final GroupedShardConsumers grouped = new GroupedShardConsumers(groupId);
+        scheduler.groupedShardInfoShardConsumersMap().put(shardGroupInfo, grouped);
+        grouped.addShard(shardInfo0, shardConsumer0);
+        grouped.addShard(shardInfo1, shardConsumer1);
+
+        // assignedShards contains only shardInfo0, shardInfo1 should be removed from the group
+        Set<ShardInfo> assigned = new HashSet<>();
+        assigned.add(shardInfo0);
+        scheduler.cleanupGroupedShardConsumers(assigned);
+
+        assertEquals(1, grouped.shardCount());
+        assertTrue(grouped.shardsView().containsKey(shardInfo0));
+        assertFalse(grouped.shardsView().containsKey(shardInfo1));
+        assertTrue(scheduler.groupedShardInfoShardConsumersMap().containsKey(shardGroupInfo));
+
+        // Now remove assignment for shardInfo0 as well -> group should be shutdown and removed
+        assigned.clear();
+        scheduler.cleanupGroupedShardConsumers(assigned);
+
+        assertFalse(scheduler.groupedShardInfoShardConsumersMap().containsKey(shardGroupInfo));
+        assertTrue(grouped.isShutdown());
     }
 
     @Test
